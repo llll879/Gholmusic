@@ -1,0 +1,10 @@
+{
+  "name": "GhOuL music",
+  "short_name": "GhOuL",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#050507",
+  "theme_color": "#050507",
+  "lang": "ru",
+  "icons": [{ "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}
