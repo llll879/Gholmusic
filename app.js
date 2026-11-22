@@ -61,9 +61,9 @@ const isFav = id => S.favs.some(t => t.id === id);
 
 function art(t) {
   if (t.art) return t.art;
-  // Чёрное стекло с искрой; лёгкий оттенок зависит от трека
-  const h = hash(t.title + t.artist) % 360;
-  return 'data:image/svg+xml;utf8,' + encodeURIComponent(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='hsl(${h} 14% 26%)'/><stop offset='1' stop-color='hsl(${h} 12% 6%)'/></linearGradient><radialGradient id='r'><stop offset='0' stop-color='#fff' stop-opacity='.35'/><stop offset='1' stop-color='#fff' stop-opacity='0'/></radialGradient></defs><rect width='100' height='100' fill='url(#g)'/><circle cx='50' cy='50' r='30' fill='url(#r)'/><path d='M50 22c1.600 14 8 26 28 28-20 2-26.400 14-28 28-1.600-14-8-26-28-28 20-2 26.400-14 28-28z' fill='none' stroke='#fff' stroke-opacity='.85' stroke-width='1.600' stroke-linejoin='round'/></svg>`);
+  // Заглушка для своих файлов: первая буква названия на тёмном фоне, оттенок зависит от трека
+  const h = hash(t.title + t.artist) % 360, ch = esc((String(t.title || '?').trim().charAt(0) || '?').toUpperCase());
+  return 'data:image/svg+xml;utf8,' + encodeURIComponent(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='hsl(${h} 12% 24%)'/><stop offset='1' stop-color='hsl(${h} 10% 7%)'/></linearGradient></defs><rect width='100' height='100' fill='url(#g)'/><text x='50' y='66' font-size='52' text-anchor='middle' font-family='Georgia,Times New Roman,serif' fill='#fff' fill-opacity='.82'>${ch}</text></svg>`);
 }
 const icon = n => `<svg><use href="#i-${n}"/></svg>`;
 
@@ -78,7 +78,7 @@ function openSheet(html, mount) {
   if (mount) mount($('#sheet'));
 }
 const closeSheet = () => { $('#sheetWrap').hidden = true; };
-const THEMES = ['ghoul', 'ice', 'ember', 'toxic', 'violet'];
+const THEMES = ['ghoul', 'ice', 'ember'];
 let accRGB = [244, 244, 248];
 function applySettings() {
   if (!THEMES.includes(S.settings.theme)) S.settings.theme = 'ghoul';
@@ -140,6 +140,7 @@ const cdKey = a => 'cd.' + a;
 const cooldownLeft = a => Math.max(0, Math.ceil((store.get(cdKey(a), 0) - Date.now()) / 1000));
 
 function setSession(d) {
+  store.set('had', true);
   S.session = { access_token: d.access_token, refresh_token: d.refresh_token, expires_at: d.expires_at || Math.floor(Date.now() / 1000) + (d.expires_in || 3600), user: d.user };
   save('session');
 }
@@ -150,7 +151,23 @@ async function getToken() {
   catch (e) { if (e.status === 400 || e.status === 401) logout(true); return null; }
 }
 function logout(silent) {
-  S.session = null; store.del('session'); syncState('off'); if (!silent) toast('Ты вышел из аккаунта'); route();
+  S.session = null; store.del('session'); syncState('off'); stopPlayback();
+  if (!silent) toast('Ты вышел из аккаунта'); route();
+}
+/* Слушать можно только после входа: любой запуск без аккаунта ведёт в профиль */
+let pendingPlay = null;
+function needAuth(fn) {
+  pendingPlay = fn || null;
+  $('#player').classList.remove('open'); $('#player').setAttribute('aria-hidden', 'true'); closeSheet();
+  V.authMode = store.get('had', false) ? 'login' : 'signup';
+  V.authMsg = { kind: 'ok', title: 'Музыка — для своих', text: 'Слушать можно после регистрации. Создай аккаунт или войди, это займёт минуту.' };
+  route('profile'); toast('Сначала войди в аккаунт');
+}
+function resumePending() { const f = pendingPlay; pendingPlay = null; if (f) { route('home'); setTimeout(f, 150); } }
+function stopPlayback() {
+  audio.pause(); audio.removeAttribute('src'); try { audio.load(); } catch { }
+  P.token++; P.queue = []; P.i = -1; P.cur = null; P.wave = null;
+  $('#mini').hidden = true; document.title = 'GhOuL music'; waveBusy = false; paintDrum();
 }
 
 /* Синхронизация избранного и плейлистов (таблица из README) */
@@ -158,7 +175,7 @@ let syncTimer, syncStatus = 'off';
 function syncState(s) {
   syncStatus = s; const b = $('#syncBadge');
   b.hidden = !S.session;
-  b.textContent = { ok: '● Синхронизировано', busy: '● Синхронизация…', fail: '● Синхронизация недоступна' }[s] || '';
+  b.textContent = { ok: 'Синхронизировано', busy: 'Синхронизация…', fail: 'Синхронизация недоступна' }[s] || '';
   b.classList.toggle('on', s === 'ok');
 }
 async function syncNow(pullFirst) {
@@ -188,11 +205,15 @@ function changed(...keys) { keys.forEach(save); queueSync(); }
 
 /* ---------- Плеер ---------- */
 const audio = $('#audio');
-const P = { queue: [], i: -1, cur: null, shuffle: false, repeat: 0, url: null, token: 0, errs: 0, lyr: null, lyrOn: false, lastT: 0, counted: false };
+const P = { queue: [], i: -1, cur: null, shuffle: false, repeat: 0, url: null, token: 0, errs: 0, lyr: null, lyrOn: false, lastT: 0, counted: false, wave: null };
 
 async function playList(key, i) { const l = LISTS[key]; if (l) playQueue(l, i); }
-function playQueue(list, i = 0) { P.queue = list.slice(); P.i = i; playIndex(i); }
+function playQueue(list, i = 0, meta) {
+  if (!S.session) return needAuth(() => playQueue(list, i, meta));
+  P.queue = list.slice(); P.i = i; P.wave = meta && meta.wave != null ? meta.wave : null; playIndex(i);
+}
 async function playIndex(i) {
+  if (!S.session) return needAuth();
   const t = P.queue[i]; if (!t) return;
   P.i = i; const my = ++P.token; P.cur = reg(t); P.counted = false; P.lastT = 0;
   let src = t.src;
@@ -218,7 +239,7 @@ function step(dir, auto) {
   if (i < 0) i = P.queue.length - 1;
   playIndex(i);
 }
-const toggle = () => { if (!P.cur) return; audio.paused ? audio.play().catch(() => { }) : audio.pause(); };
+const toggle = () => { if (!P.cur) return; if (!S.session) return needAuth(); audio.paused ? audio.play().catch(() => { }) : audio.pause(); };
 
 audio.addEventListener('play', paintState);
 audio.addEventListener('pause', paintState);
@@ -251,12 +272,16 @@ function paintState() {
   $('#player').classList.toggle('playing', pl);
   markNow(); if (pl) startViz(); paintDrum();
 }
-/* Капсула внутри барабана на главной */
+/* Капсула внутри барабана, название волны и точки */
 function paintDrum() {
+  DR.dirty = true;
+  const w = WAVES[waveIdx], name = $('#waveName');
+  if (name) { name.textContent = waveBusy ? 'Собираю волну…' : w.name; $('#waveBtn').disabled = waveBusy; }
+  $$('#waveDots button').forEach((b, i) => b.classList.toggle('on', i === waveIdx));
   const ti = $('#dcTitle'); if (!ti) return;
   const t = P.cur;
-  ti.textContent = t ? t.title : 'Моя волна';
-  $('#dcArtist').textContent = t ? t.artist : 'Нажми и слушай';
+  ti.textContent = t ? t.title : w.name;
+  $('#dcArtist').textContent = t ? t.artist : (S.session ? 'Проведи пальцем: другая волна' : 'Войди, чтобы слушать');
   $('#dcPlay use').setAttribute('href', '#i-' + (t && !audio.paused ? 'pause' : 'play'));
 }
 function paintPlayer() {
@@ -264,7 +289,7 @@ function paintPlayer() {
   $('#mini').hidden = false;
   $('#miniArt').src = art(t); $('#miniTitle').textContent = t.title; $('#miniArtist').textContent = t.artist;
   $('#pArt').src = art(t); $('#pTitle').textContent = t.title; $('#pArtist').textContent = t.artist;
-  $('#pSource').textContent = t.id.startsWith('local:') ? 'Файл на устройстве' : (t.source || 'Сейчас играет');
+  $('#pSource').textContent = P.wave != null ? 'Волна · ' + WAVES[P.wave].name : t.id.startsWith('local:') ? 'Файл на устройстве' : (t.source || 'Сейчас играет');
   $('#pFav').classList.toggle('on', isFav(t.id));
   $('#pShuffle').classList.toggle('on', P.shuffle);
   $('#pRepeat').classList.toggle('on', P.repeat > 0);
@@ -374,10 +399,15 @@ function syncLyrics(t) {
   const p = $(`p[data-i="${k}"]`, el); if (p) { p.classList.add('cur'); p.scrollIntoView({ block: 'center', behavior: S.settings.calm ? 'auto' : 'smooth' }); }
 }
 
-/* ---------- Поиск (iTunes Search API) ---------- */
-const norm = r => reg({ id: 'it:' + r.trackId, title: r.trackName, artist: r.artistName, album: r.collectionName || '', art: (r.artworkUrl100 || '').replace('100x100', '400x400'), src: r.previewUrl, dur: 30, source: 'Фрагмент 30 сек · iTunes' });
-async function itunes(term, { limit = 30, country = '', signal } = {}) {
-  const u = `https://itunes.apple.com/search?media=music&entity=song&limit=${limit}&term=${encodeURIComponent(term)}${country ? '&country=' + country : ''}`;
+/* ---------- Каталог (iTunes Search API) и подборки ---------- */
+const norm = r => reg({ id: 'it:' + r.trackId, title: r.trackName, artist: r.artistName, album: r.collectionName || '', art: (r.artworkUrl100 || '').replace('100x100', '400x400'), src: r.previewUrl, dur: 30, source: 'Фрагмент 30 сек · iTunes', year: r.releaseDate ? +String(r.releaseDate).slice(0, 4) : 0 });
+/* iTunes отвечает 429 при частых запросах (около 20 в минуту), поэтому запросы за подборками идут через очередь */
+const itQ = []; let itBusy = false;
+async function itPump() { if (itBusy) return; itBusy = true; while (itQ.length) { itQ.shift()(); await new Promise(r => setTimeout(r, 200)); } itBusy = false; }
+const itSlot = hi => new Promise(res => { hi ? itQ.unshift(res) : itQ.push(res); itPump(); });
+async function itunes(term, { limit = 30, country = '', signal, attribute, queue } = {}) {
+  if (queue) await itSlot(queue === 'hi');
+  const u = `https://itunes.apple.com/search?media=music&entity=song&limit=${limit}&term=${encodeURIComponent(term)}${country ? '&country=' + country : ''}${attribute ? '&attribute=' + attribute : ''}`;
   const r = await fetch(u, { signal });
   if (r.status === 429 || r.status === 403) throw new Error('rate');
   if (!r.ok) throw new Error('http');
@@ -385,6 +415,115 @@ async function itunes(term, { limit = 30, country = '', signal } = {}) {
   return (j.results || []).filter(x => x.previewUrl && x.trackName).map(norm);
 }
 const searchErr = e => e.message === 'rate' ? 'Сервис поиска ограничил частоту запросов. Попробуй позже.' : 'Не удалось выполнить поиск. Проверь интернет.';
+
+const shuffle = a => a.map(x => [Math.random(), x]).sort((p, q) => p[0] - q[0]).map(x => x[1]);
+const keyOf = t => t.title.toLowerCase().replace(/\s*[\(\[].*?[\)\]]/g, '').trim() + '|' + t.artist.toLowerCase();
+const JUNK = /karaoke|караоке|instrumental|инструментал|tribute|lullaby|8d audio|nightcore|slowed|sped up|минус|\bcover\b|made famous|в стиле/i;
+const words = s => String(s).toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter(Boolean);
+/* Исполнитель считается совпавшим, если в имени есть все слова из запроса: так «Мот» не тянет «Мотив» */
+const sameArtist = (name, alts) => { const have = words(name); return alts.some(a => { const w = words(a); return w.length && w.every(x => have.includes(x)); }); };
+
+/* Треки одного исполнителя: точный поиск по имени артиста, ответ кэшируется на сутки */
+async function artistTracks(name, country, modern, hi) {
+  const alts = name.split('|'), key = 'ac.' + country + '.' + alts[0], hit = store.get(key, null);
+  if (hit && Date.now() - hit.ts < 864e5) return hit.tracks.map(reg);
+  let list = [];
+  try {
+    for (const alt of alts) {
+      const raw = await itunes(alt, { limit: 14, country, attribute: 'artistTerm', queue: hi ? 'hi' : true });
+      list = raw.filter(t => sameArtist(t.artist, alts) && !JUNK.test(t.title + ' ' + t.album));
+      if (list.length) break;
+    }
+  } catch (e) { if (hit) return hit.tracks.map(reg); throw e; }
+  if (modern) { const fresh = list.filter(t => t.year >= 2016); if (fresh.length >= 3) list = fresh; }
+  store.set(key, { ts: Date.now(), tracks: list.map(slim) });
+  return list;
+}
+/* По одному треку от каждого исполнителя по кругу, без повторов */
+function weave(lists, max) {
+  const out = [], seen = new Set();
+  for (let r = 0; out.length < max; r++) {
+    let any = false;
+    for (const l of lists) { const t = l[r]; if (!t) continue; any = true; const k = keyOf(t); if (seen.has(k)) continue; seen.add(k); out.push(t); if (out.length >= max) break; }
+    if (!any) break;
+  }
+  return out;
+}
+
+const POOLS = {
+  hits: { title: 'Русские хиты сейчас', country: 'RU', modern: true, artists: ['Макс Корж', 'Мот', 'Jony', 'HammAli & Navai', 'Artik & Asti', 'Zivert', 'Клава Кока', 'Тима Белорусских', 'Егор Крид', 'Элджей', 'Niletto', 'Мари Краймбрери', 'Люся Чеботина', 'Rauf & Faik', 'Miyagi & Эндшпиль', 'Скриптонит'] },
+  rap: { title: 'Русский рэп', country: 'RU', modern: true, artists: ['Скриптонит', 'Баста', 'Miyagi & Эндшпиль', 'Oxxxymiron', 'ЛСП|LSP', 'Хаски|Husky', 'Big Baby Tape', 'Kizaru', 'Face', 'Boulevard Depo', 'Pharaoh', 'Моргенштерн|Morgenshtern', 'Andy Panda', 'Feduk', 'Гуф|Guf', 'Каспийский груз', 'Элджей', 'Макс Корж'] },
+  pop: { title: 'Русский поп', country: 'RU', modern: true, artists: ['Монеточка', 'Zivert', 'Dora', 'Мари Краймбрери', 'Клава Кока', 'Люся Чеботина', 'Анна Асти', 'Полина Гагарина', 'Нюша', 'Loboda|Светлана Лобода', 'Ёлка', 'Мэйби Бэйби', 'Ramil\'', 'Миша Марвин', 'Artik & Asti', 'Мот'] },
+  rock: { title: 'Рок и инди', country: 'RU', modern: false, artists: ['Нервы', 'Звери', 'Земфира', 'Мумий Тролль', 'Сплин', 'Anacondaz', 'Порнофильмы', 'The Hatters', 'Therr Maitz', 'Shortparis', 'Дайте танк (!)|Дайте танк', 'Lumen', 'Би-2|Bi-2', 'Ночные снайперы', 'Пикник'] },
+  night: { title: 'Вечерний вайб', country: 'RU', modern: true, artists: ['Макс Корж', 'Miyagi & Эндшпиль', 'Jony', 'HammAli & Navai', 'Rauf & Faik', 'Скриптонит', 'Элджей', 'Мот', 'Тима Белорусских', 'Slava Marlow', 'Kai Angel', 'Zivert', 'Монеточка'] },
+  world: { title: 'Мировые хиты', country: 'US', modern: true, artists: ['The Weeknd', 'Dua Lipa', 'Imagine Dragons', 'Billie Eilish', 'Ed Sheeran', 'Post Malone', 'Doja Cat', 'Harry Styles', 'Coldplay', 'Bruno Mars', 'Olivia Rodrigo', 'Travis Scott'] },
+  edm: { title: 'Электроника', country: 'US', modern: false, artists: ['Daft Punk', 'Calvin Harris', 'Martin Garrix', 'Alan Walker', 'David Guetta', 'Kygo', 'Avicii', 'Swedish House Mafia', 'Tiësto', 'Marshmello', 'Disclosure', 'ODESZA'] },
+};
+POOLS.mix = { title: 'Моя волна', country: 'RU', modern: true, artists: [...new Set([...POOLS.hits.artists, ...POOLS.rap.artists, ...POOLS.pop.artists, ...POOLS.night.artists])] };
+/* Волны на барабане: свайп влево/вправо */
+const WAVES = [
+  { id: 'my', name: 'Моя волна', pool: 'mix' },
+  { id: 'rap', name: 'Русский рэп', pool: 'rap' },
+  { id: 'pop', name: 'Русский поп', pool: 'pop' },
+  { id: 'rock', name: 'Рок и инди', pool: 'rock' },
+  { id: 'night', name: 'Ночной вайб', pool: 'night' },
+  { id: 'world', name: 'Мировые хиты', pool: 'world' },
+  { id: 'edm', name: 'Электроника', pool: 'edm' },
+];
+const SHELF_IDS = ['hits', 'rap', 'pop', 'rock', 'night', 'world', 'edm'];
+const shelfCache = {};
+
+async function loadPool(id, { n = 6, per = 4, max = 20, hi } = {}) {
+  const pool = POOLS[id], names = shuffle(pool.artists).slice(0, n);
+  let fails = 0, lastErr;
+  const lists = await Promise.all(names.map(a => artistTracks(a, pool.country, pool.modern, hi).catch(e => { fails++; lastErr = e; return []; })));
+  if (fails === names.length) throw lastErr;
+  return weave(lists.map(l => shuffle(l).slice(0, per)), max);
+}
+async function buildWave(w) {
+  if (w.id !== 'my') return loadPool(w.pool, { n: 6, per: 6, max: 40, hi: true });
+  // «Моя волна»: любимые исполнители из истории и избранного + новые из русской подборки
+  const cnt = {};
+  [...S.favs, ...S.history.map(h => h.track)].forEach(t => { if (t.id.startsWith('local:') || !t.artist) return; cnt[t.artist] = (cnt[t.artist] || 0) + 1; });
+  const top = Object.entries(cnt).sort((a, b) => b[1] - a[1]).slice(0, 3).map(a => a[0]);
+  if (!top.length) return loadPool('mix', { n: 6, per: 6, max: 40, hi: true });
+  const mine = await Promise.all(top.map(a => artistTracks(a, 'RU', false, true).catch(() => [])));
+  const disc = await loadPool('mix', { n: 4, per: 5, max: 20, hi: true }).catch(() => []);
+  const out = weave([...mine.map(l => shuffle(l).slice(0, 8)), disc], 40);
+  if (!out.length) throw new Error('empty');
+  return out;
+}
+async function searchCatalog(q, signal) {
+  const stores = /[а-яё]/i.test(q) ? ['RU'] : ['RU', 'US'];
+  const rs = await Promise.allSettled(stores.map(c => itunes(q, { country: c, limit: 25, signal })));
+  if (rs.every(r => r.status === 'rejected')) throw rs[0].reason;
+  const out = [], seen = new Set();
+  rs.forEach(r => r.status === 'fulfilled' && r.value.forEach(t => { const k = keyOf(t); if (!seen.has(k)) { seen.add(k); out.push(t); } }));
+  return out;
+}
+
+/* ---------- Волны ---------- */
+let waveIdx = Math.min(Math.max(0, +store.get('wave', 0) || 0), WAVES.length - 1), waveBusy = false, waveT = 0, waveTok = 0, homeIO = null;
+function setWave(i, dir = 0) {
+  const n = WAVES.length; if (!dir) dir = i > waveIdx ? 1 : -1;
+  waveIdx = (i % n + n) % n; store.set('wave', waveIdx);
+  DR.spin = dir * Math.min(.016, Math.max(.008, Math.abs(DR.spin))); DR.kick = 1;
+  paintDrum();
+  clearTimeout(waveT);
+  // если уже слушаешь волну — переключаемся на новую сразу, как радиостанцию
+  if (P.wave != null && !audio.paused && S.session) waveT = setTimeout(() => playWave(waveIdx), 550);
+}
+async function playWave(i = waveIdx) {
+  if (!S.session) return needAuth(() => playWave(i));
+  const w = WAVES[i], my = ++waveTok; waveBusy = true; paintDrum();
+  try {
+    const tracks = await buildWave(w);
+    if (my !== waveTok) return;
+    if (!tracks.length) throw new Error('empty');
+    playQueue(tracks, 0, { wave: i });
+  } catch { if (my === waveTok) toast('Не удалось собрать волну. Проверь интернет.'); }
+  if (my === waveTok) { waveBusy = false; paintDrum(); }
+}
 
 /* ---------- Шаблоны ---------- */
 function rowHTML(t, key, i, compact) {
@@ -409,6 +548,7 @@ const view = $('#view');
 const render = html => { view.innerHTML = `<div class="view-in">${html}</div>`; view.scrollTop = 0; };
 
 function route(name = V.name, arg = V.arg) {
+  if (homeIO) { homeIO.disconnect(); homeIO = null; }
   V.name = name; V.arg = arg;
   const navOf = { playlist: 'library', history: 'home' }[name] || name;
   $$('#nav button').forEach(b => b.classList.toggle('on', b.dataset.go === navOf));
@@ -416,14 +556,6 @@ function route(name = V.name, arg = V.arg) {
   markNow();
 }
 
-const SHELVES = [
-  { id: 'hits', title: 'Хиты сейчас', q: 'top hits' },
-  { id: 'rap', title: 'Русский рэп', q: 'русский рэп', country: 'RU' },
-  { id: 'rock', title: 'Рок-классика', q: 'classic rock' },
-  { id: 'edm', title: 'Электроника', q: 'electronic dance' },
-  { id: 'chill', title: 'Чилл и лоу-фай', q: 'lofi chill' },
-];
-const shelfCache = {};
 function greeting() { const h = new Date().getHours(); return h < 5 ? 'Доброй ночи' : h < 12 ? 'Доброе утро' : h < 18 ? 'Добрый день' : 'Добрый вечер'; }
 
 const recentTracks = max => {
@@ -434,9 +566,9 @@ const recentTracks = max => {
 const CHEV = '<svg class="chev"><use href="#i-chev"/></svg>';
 
 function vHome() {
-  const recent = recentTracks(5);
+  const recent = recentTracks(5), w = WAVES[waveIdx];
   render(`<section class="hero2"><i class="beam"></i>
-      <button class="wave-pill" id="waveBtn">${icon('sparkle')}<span>Моя волна</span></button>
+      <button class="wave-pill" id="waveBtn">${icon('sparkle')}<span id="waveName">${esc(w.name)}</span></button>
       <div class="mark">
         <svg class="orbit" viewBox="0 0 400 200" aria-hidden="true">
           <g transform="rotate(-12 200 100)"><ellipse cx="200" cy="100" rx="196" ry="52" class="o1"/><circle r="3.500" class="dot"><animateMotion dur="18s" repeatCount="indefinite" path="M4 100a196 52 0 1 0 392 0a196 52 0 1 0 -392 0"/></circle></g>
@@ -444,13 +576,14 @@ function vHome() {
         </svg>
         <h1 class="wordmark silver">GhOuL</h1><div class="wm-sub">music</div>
       </div>
-      <div class="drum" id="drum"><canvas id="drumCv"></canvas>
+      <div class="drum" id="drum" aria-label="Барабан волн: проведи пальцем влево или вправо"><canvas id="drumCv"></canvas>
         <div class="drum-card">
           <button class="dc-btn" id="dcOpen" aria-label="Открыть плеер">${icon('eq')}</button>
           <button class="dc-main" id="dcMain"><b id="dcTitle"></b><small id="dcArtist"></small></button>
           <button class="dc-btn dc-play" id="dcPlay" aria-label="Пауза/играть">${icon('pause')}</button>
         </div>
       </div>
+      <div class="wave-dots" id="waveDots" role="group" aria-label="Волны">${WAVES.map((x, i) => `<button data-wave="${i}" class="${i === waveIdx ? 'on' : ''}" aria-label="${esc(x.name)}"></button>`).join('')}</div>
       <p class="tagline"><span>Музыка, которая всегда с тобой.</span></p>
     </section>
     <nav class="quick">
@@ -460,20 +593,24 @@ function vHome() {
     </nav>
     <h3>Недавно прослушанное${recent.length ? `<button class="more-link" data-go="history">Все ${icon('arrow')}</button>` : ''}</h3>
     ${recent.length ? listHTML(recent, 'recent', true) : '<p class="sub">Здесь появятся треки, которые ты послушаешь.</p>'}
-    <div id="shelves">${SHELVES.map(s => `<h3>${s.title}</h3><div id="sh-${s.id}">${skelShelf()}</div>`).join('')}</div>`);
-  $('#waveBtn').onclick = startWave;
-  const toPlayer = () => P.cur ? openPlayer() : startWave();
+    <div id="shelves">${SHELF_IDS.map(id => `<h3>${esc(POOLS[id].title)}</h3><div id="sh-${id}" data-shelf="${id}">${skelShelf()}</div>`).join('')}</div>`);
+  $('#waveBtn').onclick = () => playWave();
+  const toPlayer = () => P.cur ? openPlayer() : playWave();
   $('#dcOpen').onclick = toPlayer; $('#dcMain').onclick = toPlayer;
-  $('#dcPlay').onclick = () => P.cur ? toggle() : startWave();
+  $('#dcPlay').onclick = () => P.cur ? toggle() : playWave();
   paintDrum(); startDrum(); svgMotion();
-  SHELVES.forEach(async s => {
-    const box = () => $('#sh-' + s.id); if (!box()) return;
-    try {
-      if (!shelfCache[s.id]) shelfCache[s.id] = await itunes(s.q, { limit: 18, country: s.country });
-      if (box() && V.name === 'home') { box().innerHTML = shelfCache[s.id].length ? shelfHTML(shelfCache[s.id], 'shelf-' + s.id) : '<p class="sub">Пусто</p>'; }
-    } catch (e) { if (box() && V.name === 'home') box().innerHTML = `<p class="sub">${esc(searchErr(e))}</p>`; }
-  });
+  // полки подгружаются, когда до них доскроллили: так мы не упираемся в лимит запросов iTunes
+  const io = new IntersectionObserver(es => es.forEach(e => { if (e.isIntersecting) { io.unobserve(e.target); loadShelf(e.target.dataset.shelf); } }), { root: view, rootMargin: '300px 0px' });
+  homeIO = io; $$('[data-shelf]').forEach(el => io.observe(el));
 }
+async function loadShelf(id) {
+  const box = () => V.name === 'home' ? $('#sh-' + id) : null; if (!box()) return;
+  try {
+    if (!shelfCache[id]) shelfCache[id] = await loadPool(id, { n: 6, per: 4, max: 20 });
+    const b = box(); if (b) b.innerHTML = shelfCache[id].length ? shelfHTML(shelfCache[id], 'shelf-' + id) : '<p class="sub">Пока пусто</p>';
+  } catch (e) { const b = box(); if (b) b.innerHTML = `<p class="sub">${esc(searchErr(e))} <button class="link" data-retry="${id}">Повторить</button></p>`; }
+}
+
 /* ---------- Барабан: стеклянный цилиндр с эквалайзером (canvas) ---------- */
 function glow(g, x, y, s, A, k = 1) {
   const gr = g.createRadialGradient(x, y, 0, x, y, s);
@@ -489,76 +626,96 @@ function sparkle(g, x, y, s, A, k = 1) {
     g.strokeStyle = gr; g.lineWidth = 1; g.beginPath(); g.moveTo(a, b); g.lineTo(c, d); g.stroke();
   });
 }
-function drawDrum(g, W, H, dpr, t, en, rot, seeds) {
+const DR = { spin: 0, kick: 0, rot: Math.random() * 6, seeds: null, seedFor: -1, dirty: true };
+const rng = s => () => { s |= 0; s = s + 0x6D2B79F5 | 0; let t = Math.imul(s ^ s >>> 15, 1 | s); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+const seedsFor = i => { const r = rng(hash('wave' + i) + 7); return Array.from({ length: 84 }, () => ({ a: r() * 6.283, b: r() * 6.283 })); };
+const DRUM_RX = .4;
+
+function drawDrum(g, W, H, dpr, t, en, rot, seeds, kick, wi) {
   const PI = Math.PI, TAU = PI * 2, N = seeds.length, A = accRGB.join(',');
-  const cx = W / 2, rx = W * .43, ry = rx * .2, yt = H * .19, hc = H * .46, yb = yt + hc;
+  const cx = W / 2, rx = W * DRUM_RX, ry = rx * .21, yt = H * .2, hc = H * .48, yb = yt + hc;
+  const e = Math.min(1, en + kick * .7);
   const ell = (x, y, a, b, a0, a1) => { g.beginPath(); g.ellipse(x, y, a, b, 0, a0, a1); };
-  const beat = Math.pow(Math.max(0, Math.sin(t / 80)), 6) * en;
+  const beat = Math.pow(Math.max(0, Math.sin(t / 80)), 6) * en + kick * .6;
   g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
   g.lineCap = 'round';
 
   // внешние орбиты (задняя половина)
-  const rA = { y: yb + ry + W * .02, rx: rx * 1.04, ry: ry * 1.35 }, rB = { y: yb + ry * .6, rx: rx * 1.09, ry: ry * 1.1 };
+  const rA = { y: yb + ry + W * .02, rx: rx * 1.05, ry: ry * 1.35 }, rB = { y: yb + ry * .6, rx: rx * 1.1, ry: ry * 1.1 };
   g.lineWidth = 1;
-  [rA, rB].forEach((r, k) => { g.strokeStyle = `rgba(${A},${k ? .14 : .26})`; ell(cx, r.y, r.rx, r.ry, PI, TAU); g.stroke(); });
+  [rA, rB].forEach((r, k) => { g.strokeStyle = `rgba(${A},${k ? .2 : .34})`; ell(cx, r.y, r.rx, r.ry, PI, TAU); g.stroke(); });
 
   // постамент: боковина + верхняя площадка
   const pr = rx * 1.07, pry = ry * 1.13, pd = W * .03;
   g.beginPath(); g.moveTo(cx - pr, yb); g.lineTo(cx - pr, yb + pd); g.ellipse(cx, yb + pd, pr, pry, 0, PI, 0, true);
   g.lineTo(cx + pr, yb); g.ellipse(cx, yb, pr, pry, 0, 0, PI, false); g.closePath();
   let gr = g.createLinearGradient(cx - pr, 0, cx + pr, 0);
-  gr.addColorStop(0, '#42424d'); gr.addColorStop(.25, '#1b1b21'); gr.addColorStop(.7, '#0c0c10'); gr.addColorStop(1, '#2a2a32');
+  gr.addColorStop(0, '#4a4a55'); gr.addColorStop(.25, '#1d1d24'); gr.addColorStop(.7, '#0c0c10'); gr.addColorStop(1, '#2e2e37');
   g.fillStyle = gr; g.fill();
-  g.lineWidth = 1.2; ell(cx, yb + pd, pr, pry, 0, PI); g.strokeStyle = 'rgba(255,255,255,.4)'; g.stroke();
+  g.lineWidth = 1.2; ell(cx, yb + pd, pr, pry, 0, PI); g.strokeStyle = 'rgba(255,255,255,.45)'; g.stroke();
   ell(cx, yb, pr, pry, 0, TAU); gr = g.createLinearGradient(0, yb - pry, 0, yb + pry);
-  gr.addColorStop(0, '#15151a'); gr.addColorStop(1, '#2b2b33'); g.fillStyle = gr; g.fill();
-  g.strokeStyle = 'rgba(255,255,255,.5)'; g.stroke();
+  gr.addColorStop(0, '#15151a'); gr.addColorStop(1, '#2d2d35'); g.fillStyle = gr; g.fill();
+  g.strokeStyle = 'rgba(255,255,255,.55)'; g.stroke();
   // свечение пола под столбиками
   g.save(); g.translate(cx, yb); g.scale(1, ry / rx * 1.05);
   gr = g.createRadialGradient(0, 0, 0, 0, 0, rx);
-  const fl = (.3 + .35 * beat) * (.4 + .6 * en);
+  const fl = (.34 + .35 * beat) * (.45 + .55 * e);
   gr.addColorStop(0, `rgba(${A},${fl})`); gr.addColorStop(.6, `rgba(${A},${fl * .25})`); gr.addColorStop(1, `rgba(${A},0)`);
   g.fillStyle = gr; g.beginPath(); g.arc(0, 0, rx, 0, TAU); g.fill(); g.restore();
+  // пунктирная волна на полу
+  for (let i = 0; i < 48; i++) {
+    const u = i / 47 * 2 - 1, x = cx + u * rx * .84, y = yb + ry * .1 + Math.sin(u * 5.5 + t / 600 + wi) * ry * .5 * (.3 + .7 * e);
+    g.fillStyle = `rgba(255,255,255,${.2 + .6 * (1 - Math.abs(u))})`; g.fillRect(x - .7, y - .7, 1.6, 1.6);
+  }
 
   // задняя внутренняя стенка стекла
   g.beginPath(); g.moveTo(cx - rx, yt); g.ellipse(cx, yt, rx, ry, 0, PI, TAU); g.lineTo(cx + rx, yb); g.ellipse(cx, yb, rx, ry, 0, TAU, PI, true); g.closePath();
-  gr = g.createLinearGradient(0, yt - ry, 0, yb); gr.addColorStop(0, 'rgba(255,255,255,.1)'); gr.addColorStop(1, 'rgba(255,255,255,.015)');
+  gr = g.createLinearGradient(0, yt - ry, 0, yb); gr.addColorStop(0, 'rgba(255,255,255,.09)'); gr.addColorStop(1, 'rgba(255,255,255,.012)');
   g.fillStyle = gr; g.fill();
 
   // столбики-колонны по кругу
-  const bars = [], bw = Math.max(3, W / 100);
+  const bars = [], bw = Math.max(2.4, W / 135);
   for (let i = 0; i < N; i++) {
-    const th = i / N * TAU + rot, z = Math.sin(th), k = i / N * TAU;
-    let v = (Math.sin(t / 230 + seeds[i].a + k * 3) + Math.sin(t / 410 + seeds[i].b + k * 5) * .8 + Math.sin(t / 95 + i * 1.7) * .35 + 2.15) / 4.3;
+    const th = i / N * TAU + rot, z = Math.sin(th), k = i / N * TAU, sd = seeds[i];
+    let v = (Math.sin(t / 230 + sd.a + k * 3 + wi) + Math.sin(t / 410 + sd.b + k * 5) * .8 + Math.sin(t / 95 + i * 1.7) * .35 + 2.15) / 4.3;
     v = Math.max(0, Math.min(1, v));
-    const idle = .09 + .2 * Math.pow(Math.sin(i * 1.7 + seeds[i].a), 2) + .05 * (1 + Math.sin(t / 1100 + i * .5));
-    const lv = Math.min(1, idle * (1 - en) + (.16 + Math.pow(v, 1.4) * .82 + beat * .2 * (1 - v * .5)) * en);
-    bars.push({ x: cx + Math.cos(th) * rx * .88, y: yb + z * ry * .88, z, h: Math.max(4, lv * hc * .96) });
+    const idle = .2 + .34 * Math.pow(Math.sin(i * 1.7 + sd.a), 2) + .06 * (1 + Math.sin(t / 1100 + i * .5));
+    const lv = Math.min(1, idle * (1 - e) + (.18 + Math.pow(v, 1.4) * .8 + beat * .2 * (1 - v * .5)) * e);
+    bars.push({ x: cx + Math.cos(th) * rx * .9, y: yb + z * ry * .9, z, h: Math.max(5, lv * hc * .95) });
   }
   bars.sort((a, b) => a.z - b.z);
   for (const b of bars) {
-    const a = b.z < 0 ? .72 : 1, x0 = b.x - bw / 2, top = b.y - b.h;
-    g.globalCompositeOperation = 'lighter'; g.fillStyle = `rgba(${A},${.07 * a})`; g.fillRect(b.x - bw * 1.7, top, bw * 3.4, b.h);
+    const a = b.z < 0 ? .62 : 1, x0 = b.x - bw / 2, top = b.y - b.h;
+    g.globalCompositeOperation = 'lighter'; g.fillStyle = `rgba(${A},${.1 * a})`; g.fillRect(b.x - bw * 1.8, top, bw * 3.6, b.h);
     g.globalCompositeOperation = 'source-over';
-    gr = g.createLinearGradient(x0, 0, x0 + bw, 0);
-    gr.addColorStop(0, `rgba(255,255,255,${.95 * a})`); gr.addColorStop(.4, `rgba(${A},${.85 * a})`); gr.addColorStop(1, `rgba(${A},${.3 * a})`);
-    g.fillStyle = gr; g.fillRect(x0, top, bw, b.h);
-    gr = g.createLinearGradient(0, b.y, 0, top); gr.addColorStop(0, 'rgba(5,5,7,.7)'); gr.addColorStop(.6, 'rgba(5,5,7,0)');
+    gr = g.createLinearGradient(0, top, 0, b.y); gr.addColorStop(0, `rgba(255,255,255,${a})`); gr.addColorStop(.7, `rgba(${A},${.82 * a})`); gr.addColorStop(1, `rgba(${A},${.22 * a})`);
     g.fillStyle = gr; g.fillRect(x0, top, bw, b.h);
     ell(b.x, top, bw / 2, bw * .3, 0, TAU); g.fillStyle = `rgba(255,255,255,${a})`; g.fill();
-    if (b.h > hc * .5) glow(g, b.x, top, bw * 2.4, A, .5 * a);
+    if (b.h > hc * .5) glow(g, b.x, top, bw * 2.6, A, .55 * a);
   }
+
+  // две волны внутри цилиндра
+  g.globalCompositeOperation = 'lighter'; g.lineWidth = 1.1;
+  for (let k = 0; k < 2; k++) {
+    g.beginPath();
+    for (let x = -rx * .88; x <= rx * .88; x += 5) {
+      const u = x / rx, y = yb - hc * (.3 + k * .13) + Math.sin(u * (3.2 + k * 1.4) + t / 900 * (k ? -1 : 1) + rot * 2 + wi) * hc * (.05 + .06 * e) * (1 - u * u * .5);
+      x === -rx * .88 ? g.moveTo(cx + x, y) : g.lineTo(cx + x, y);
+    }
+    g.strokeStyle = `rgba(${A},${.36 - k * .14})`; g.stroke();
+  }
+  g.globalCompositeOperation = 'source-over';
 
   // передняя стеклянная стенка
   const wall = () => { g.beginPath(); g.moveTo(cx - rx, yt); g.ellipse(cx, yt, rx, ry, 0, PI, 0, true); g.lineTo(cx + rx, yb); g.ellipse(cx, yb, rx, ry, 0, 0, PI, false); g.closePath(); };
   wall();
   gr = g.createLinearGradient(cx - rx, 0, cx + rx, 0);
-  [[0, .34], [.04, .12], [.14, .035], [.5, .02], [.86, .04], [.96, .12], [1, .34]].forEach(([o, al]) => gr.addColorStop(o, `rgba(255,255,255,${al})`)); g.fillStyle = gr; g.fill();
+  [[0, .36], [.04, .13], [.14, .03], [.5, .012], [.86, .035], [.96, .13], [1, .36]].forEach(([o, al]) => gr.addColorStop(o, `rgba(255,255,255,${al})`)); g.fillStyle = gr; g.fill();
   gr = g.createLinearGradient(0, yt, 0, yb + ry);
-  [[0, .16], [.35, .0], [.8, .0], [1, .14]].forEach(([o, al]) => gr.addColorStop(o, `rgba(255,255,255,${al})`)); g.fillStyle = gr; g.fill();
+  [[0, .15], [.35, 0], [.8, 0], [1, .14]].forEach(([o, al]) => gr.addColorStop(o, `rgba(255,255,255,${al})`)); g.fillStyle = gr; g.fill();
   // блики скользят по стеклу
   g.save(); wall(); g.clip();
-  [[Math.sin(rot * .9) * .72, .15, .2], [Math.sin(rot * .9 + 1.2) * .72 + .1, .04, .09]].forEach(([o, w, al]) => {
+  [[Math.sin(rot * .9) * .72, .15, .18], [Math.sin(rot * .9 + 1.2) * .72 + .1, .04, .08]].forEach(([o, w, al]) => {
     const gx = cx + o * rx, bwd = rx * w, sh = g.createLinearGradient(gx - bwd, 0, gx + bwd, 0);
     sh.addColorStop(0, 'rgba(255,255,255,0)'); sh.addColorStop(.5, `rgba(255,255,255,${al})`); sh.addColorStop(1, 'rgba(255,255,255,0)');
     g.fillStyle = sh; g.fillRect(gx - bwd, yt - ry, bwd * 2, hc + ry * 3);
@@ -566,20 +723,21 @@ function drawDrum(g, W, H, dpr, t, en, rot, seeds) {
   g.restore();
 
   // толстая кромка стекла сверху
-  g.beginPath(); g.ellipse(cx, yt, rx, ry, 0, 0, TAU); g.moveTo(cx + rx - 9, yt); g.ellipse(cx, yt, rx - 9, ry - 2.2, 0, 0, TAU);
-  g.fillStyle = 'rgba(255,255,255,.13)'; g.fill('evenodd');
-  g.lineWidth = 1.2; ell(cx, yt, rx, ry, 0, TAU); g.strokeStyle = 'rgba(255,255,255,.55)'; g.stroke();
-  ell(cx, yt, rx - 9, ry - 2.2, 0, TAU); g.strokeStyle = 'rgba(255,255,255,.22)'; g.stroke();
-  g.lineWidth = 2; ell(cx, yt, rx, ry, 0, PI); g.strokeStyle = 'rgba(255,255,255,.92)'; g.stroke();
-  g.lineWidth = 1.4; ell(cx, yb, rx, ry, 0, PI); g.strokeStyle = 'rgba(255,255,255,.6)'; g.stroke();
+  const rim = rx * .028;
+  g.beginPath(); g.ellipse(cx, yt, rx, ry, 0, 0, TAU); g.moveTo(cx + rx - rim, yt); g.ellipse(cx, yt, rx - rim, ry - rim * .25, 0, 0, TAU);
+  g.fillStyle = 'rgba(255,255,255,.14)'; g.fill('evenodd');
+  g.lineWidth = 1.2; ell(cx, yt, rx, ry, 0, TAU); g.strokeStyle = 'rgba(255,255,255,.6)'; g.stroke();
+  ell(cx, yt, rx - rim, ry - rim * .25, 0, TAU); g.strokeStyle = 'rgba(255,255,255,.24)'; g.stroke();
+  g.lineWidth = 2; ell(cx, yt, rx, ry, 0, PI); g.strokeStyle = 'rgba(255,255,255,.95)'; g.stroke();
+  g.lineWidth = 1.4; ell(cx, yb, rx, ry, 0, PI); g.strokeStyle = 'rgba(255,255,255,.65)'; g.stroke();
   [-1, 1].forEach(s => {
-    const lg = g.createLinearGradient(0, yt, 0, yb); lg.addColorStop(0, 'rgba(255,255,255,.8)'); lg.addColorStop(1, 'rgba(255,255,255,.25)');
+    const lg = g.createLinearGradient(0, yt, 0, yb); lg.addColorStop(0, 'rgba(255,255,255,.85)'); lg.addColorStop(1, 'rgba(255,255,255,.28)');
     g.strokeStyle = lg; g.lineWidth = 1.6; g.beginPath(); g.moveTo(cx + s * rx, yt); g.lineTo(cx + s * rx, yb); g.stroke();
   });
 
   // орбиты (передняя половина) и летящие огоньки
   g.lineWidth = 1;
-  [rA, rB].forEach((r, k) => { g.strokeStyle = `rgba(${A},${k ? .22 : .5})`; ell(cx, r.y, r.rx, r.ry, 0, PI); g.stroke(); });
+  [rA, rB].forEach((r, k) => { g.strokeStyle = `rgba(${A},${k ? .3 : .6})`; ell(cx, r.y, r.rx, r.ry, 0, PI); g.stroke(); });
   [[rA, rot * 1.6, 3], [rA, rot * 1.6 + 2.6, 2.2], [rB, -rot * 1.1 + 1, 2.6], [rB, -rot * 1.1 + 4, 2]].forEach(([r, ph, s]) =>
     glow(g, cx + Math.cos(ph) * r.rx, r.y + Math.sin(ph) * r.ry, s * 3.4, A, Math.sin(ph) > 0 ? 1 : .5));
 
@@ -588,16 +746,39 @@ function drawDrum(g, W, H, dpr, t, en, rot, seeds) {
   sparkle(g, cx, yt - ry, 5.5 * u * p + 2, A, .95);
   sparkle(g, cx, yb + pry, 6 * u * p + 2, A, 1);
   sparkle(g, cx, rA.y + rA.ry, 4.5 * u + 1.5, A, .9);
-  [-1, 1].forEach(s => { sparkle(g, cx + s * rx, yt, 3.2 * u + 1.2, A, .9); sparkle(g, cx + s * rA.rx * .97, rA.y, 3.4 * u + 1.2, A, .8); });
+  [-1, 1].forEach(s => { sparkle(g, cx + s * rx, yt, 3.4 * u + 1.2, A, .95); sparkle(g, cx + s * rA.rx * .97, rA.y, 3.4 * u + 1.2, A, .8); });
 }
-let drumRaf = 0;
+
+let drumRaf = 0, suppressClick = false;
 function startDrum() {
   cancelAnimationFrame(drumRaf);
-  const cv = $('#drumCv'); if (!cv) return;
-  const g = cv.getContext('2d'), N = 72;
-  const seeds = Array.from({ length: N }, () => ({ a: Math.random() * 6.283, b: Math.random() * 6.283 }));
-  let W = 0, H = 0, dpr = 1, en = audio.paused ? 0 : 1, rot = Math.random() * 6, last = performance.now(), dirty = true;
-  const size = () => { const r = cv.getBoundingClientRect(); if (!r.width) return false; dpr = Math.min(devicePixelRatio || 1, 2); W = r.width; H = r.height; cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); dirty = true; return true; };
+  const cv = $('#drumCv'), el = $('#drum'); if (!cv || !el) return;
+  const g = cv.getContext('2d');
+  let W = 0, H = 0, dpr = 1, en = audio.paused ? 0 : 1, last = performance.now();
+  const size = () => { const r = cv.getBoundingClientRect(); if (!r.width) return false; dpr = Math.min(devicePixelRatio || 1, 2); W = r.width; H = r.height; cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); DR.dirty = true; return true; };
+
+  // жесты: потянуть барабан влево/вправо, чтобы сменить волну
+  let down = null, moved = false, lastX = 0, lastT = 0;
+  el.onpointerdown = e => { if (e.button) return; down = { x: e.clientX, y: e.clientY, id: e.pointerId }; moved = false; lastX = e.clientX; lastT = e.timeStamp; DR.spin = 0; };
+  el.onpointermove = e => {
+    if (!down) return;
+    const dx = e.clientX - down.x, dy = e.clientY - down.y;
+    if (!moved) { if (Math.abs(dx) < 8 || Math.abs(dx) < Math.abs(dy)) return; moved = true; try { el.setPointerCapture(down.id); } catch { } }
+    const step = e.clientX - lastX, dt = Math.max(1, e.timeStamp - lastT), k = 1 / (W * DRUM_RX);
+    DR.rot -= step * k; DR.spin = DR.spin * .6 - step * k / dt * .4;
+    lastX = e.clientX; lastT = e.timeStamp; DR.dirty = true;
+  };
+  const end = e => {
+    if (!down) return;
+    const dx = e.clientX - down.x, was = moved; down = null;
+    if (!was) return;
+    suppressClick = true; setTimeout(() => { suppressClick = false; }, 80);
+    if (Math.abs(dx) > 40) setWave(waveIdx + (dx < 0 ? 1 : -1), dx < 0 ? 1 : -1);
+    else if (Math.abs(DR.spin) > .006) setWave(waveIdx + (DR.spin > 0 ? 1 : -1), DR.spin > 0 ? 1 : -1);
+  };
+  el.onpointerup = end; el.onpointercancel = end;
+  el.addEventListener('click', e => { if (suppressClick) { e.stopPropagation(); e.preventDefault(); } }, true);
+
   const frame = ts => {
     if (!cv.isConnected) { drumRaf = 0; return; }
     drumRaf = requestAnimationFrame(frame);
@@ -605,12 +786,16 @@ function startDrum() {
     if (Math.abs(r.width - W) > 1 || Math.abs(r.height - H) > 1) size();
     if (!W || $('#player').classList.contains('open')) { last = ts; return; }
     const dt = Math.min(60, ts - last); last = ts;
+    if (DR.seedFor !== waveIdx) { DR.seeds = seedsFor(waveIdx); DR.seedFor = waveIdx; }
     const target = audio.paused ? 0 : 1, calm = calmNow();
-    en += (target - en) * Math.min(1, dt / 280);
-    if (calm) { if (!dirty && Math.abs(target - en) < .01) return; en = target; }
-    else rot += dt * (.00012 + en * .0003);
-    dirty = false;
-    drawDrum(g, W, H, dpr, calm ? 0 : ts, en, rot, seeds);
+    if (calm) { en = target; if (!DR.dirty) return; }
+    else {
+      en += (target - en) * Math.min(1, dt / 280);
+      if (!down) { DR.rot += dt * (.00012 + en * .0003) + DR.spin * dt; DR.spin *= Math.exp(-dt / 520); }
+      DR.kick *= Math.exp(-dt / 420);
+    }
+    DR.dirty = false;
+    drawDrum(g, W, H, dpr, calm ? 0 : ts, en, DR.rot, DR.seeds, calm ? 0 : DR.kick, waveIdx);
   };
   drumRaf = requestAnimationFrame(frame);
 }
@@ -638,24 +823,10 @@ window.__stars = (() => {
   return { restart };
 })();
 
-async function startWave() {
-  const btn = $('#waveBtn'); if (btn) btn.disabled = true;
-  try {
-    const arts = {}; [...S.favs, ...S.history.map(h => h.track)].forEach(t => arts[t.artist] = (arts[t.artist] || 0) + 1);
-    const top = Object.entries(arts).sort((a, b) => b[1] - a[1]).slice(0, 5).map(a => a[0]);
-    const seeds = top.length ? top.sort(() => Math.random() - .5).slice(0, 3) : ['top hits'];
-    const res = (await Promise.all(seeds.map(q => itunes(q, { limit: 15 }).catch(() => [])))).flat();
-    const uniq = [...new Map(res.map(t => [t.id, t])).values()].sort(() => Math.random() - .5);
-    if (!uniq.length) throw new Error('empty');
-    playQueue(uniq, 0); toast(top.length ? 'Волна по твоим вкусам' : 'Волна: хиты');
-  } catch { toast('Не удалось собрать волну. Проверь интернет.'); }
-  if (btn) btn.disabled = false;
-}
-
 let searchAbort, searchT;
 function vSearch() {
   render(`<h1>Поиск</h1><label class="field">${icon('search')}<input id="q" type="search" placeholder="Трек, исполнитель, альбом" value="${esc(V.q)}" autocomplete="off" enterkeyhint="search"></label>
-    <div class="tags">${['Звери', 'Imagine Dragons', 'Монеточка', 'Daft Punk', 'Скриптонит', 'The Weeknd'].map(t => `<button class="chip" data-tag="${esc(t)}">${esc(t)}</button>`).join('')}</div>
+    <div class="tags">${['Скриптонит', 'Монеточка', 'Miyagi', 'Макс Корж', 'Zivert', 'Jony', 'Баста', 'Нервы', 'Тима Белорусских'].map(t => `<button class="chip" data-tag="${esc(t)}">${esc(t)}</button>`).join('')}</div>
     <div id="res">${V.q ? '' : emptyHTML('Что послушаем?', 'Ищи по каталогу или среди своих файлов и избранного.')}</div>`);
   const inp = $('#q'); inp.oninput = () => { V.q = inp.value; clearTimeout(searchT); searchT = setTimeout(doSearch, 380); };
   inp.onkeydown = e => { if (e.key === 'Enter') { clearTimeout(searchT); doSearch(); inp.blur(); } };
@@ -671,7 +842,7 @@ async function doSearch() {
   box.innerHTML = head + `<h3>Каталог</h3><div id="cat">${skelShelf()}</div>`;
   if (searchAbort) searchAbort.abort(); searchAbort = new AbortController();
   try {
-    const r = await itunes(q, { signal: searchAbort.signal });
+    const r = await searchCatalog(q, searchAbort.signal);
     const cat = $('#cat'); if (!cat || V.q.trim() !== q) return;
     cat.innerHTML = r.length ? listHTML(r, 'search') : emptyHTML('Ничего не найдено', 'Попробуй другое название или исполнителя.'); markNow();
   } catch (e) { if (e.name === 'AbortError') return; const cat = $('#cat'); if (cat) cat.innerHTML = emptyHTML('Поиск недоступен', esc(searchErr(e))); }
@@ -682,9 +853,9 @@ function vLibrary() {
   let body = '';
   if (V.tab === 'fav') body = S.favs.length
     ? `<div style="display:flex;gap:10px;margin-bottom:10px"><button class="btn" data-all="play">${icon('play')} Слушать</button><button class="btn ghost" data-all="shuffle">${icon('shuffle')} Вперемешку</button></div>${listHTML(S.favs, 'favs')}`
-    : emptyHTML('Пока пусто', 'Нажми ♥ у любого трека — он появится здесь.');
+    : emptyHTML('Пока пусто', 'Нажми на сердечко у любого трека — он появится здесь.');
   if (V.tab === 'pl') body = `<button class="btn block" data-newpl style="margin-bottom:14px">${icon('plus')} Новый плейлист</button>` +
-    (S.playlists.length ? S.playlists.map(p => `<button class="pl-card" data-openpl="${p.id}"><span class="pl-cover">${p.tracks[0] && p.tracks[0].art ? `<img src="${esc(p.tracks[0].art)}" alt="">` : icon('lib')}</span><span><b>${esc(p.name)}</b><br><small style="color:var(--muted)">${plural(p.tracks.length, 'трек', 'трека', 'треков')}</small></span></button>`).join('') : emptyHTML('Плейлистов нет', 'Создай первый и добавляй в него треки через ⋯'));
+    (S.playlists.length ? S.playlists.map(p => `<button class="pl-card" data-openpl="${p.id}"><span class="pl-cover">${p.tracks[0] && p.tracks[0].art ? `<img src="${esc(p.tracks[0].art)}" alt="">` : icon('lib')}</span><span><b>${esc(p.name)}</b><br><small style="color:var(--muted)">${plural(p.tracks.length, 'трек', 'трека', 'треков')}</small></span></button>`).join('') : emptyHTML('Плейлистов нет', 'Создай первый и добавляй в него треки через меню рядом с песней'));
   if (V.tab === 'files') body = `<button class="btn block" data-import style="margin-bottom:6px">${icon('file')} Добавить аудиофайлы</button><p class="sub" style="font-size:13px">Файлы хранятся только на этом устройстве и не отправляются на сервер.</p>` +
     (localTracks.length ? listHTML(localTracks, 'files') : emptyHTML('Аудиофайлов пока нет', 'Импортируй mp3, m4a, flac, ogg — играют целиком, с синхронным текстом.'));
   render(`<h1>Библиотека</h1><div class="tabs">${tabs.map(([k, n]) => `<button data-tab="${k}" class="${V.tab === k ? 'on' : ''}">${n}</button>`).join('')}</div>${body}`);
@@ -698,7 +869,7 @@ function vPlaylist() {
   const p = S.playlists.find(x => x.id === V.arg); if (!p) return route('library');
   render(`<button class="chip" data-go="library" style="margin:8px 0 4px">${icon('back')} Библиотека</button><h1>${esc(p.name)}</h1><p class="sub">${plural(p.tracks.length, 'трек', 'трека', 'треков')}</p>
     <div style="display:flex;gap:10px;margin-bottom:10px">${p.tracks.length ? `<button class="btn" data-all="plplay">${icon('play')} Слушать</button>` : ''}<button class="btn ghost" data-rename="${p.id}">Переименовать</button><button class="btn ghost" data-delpl="${p.id}" aria-label="Удалить">${icon('trash')}</button></div>
-    ${p.tracks.length ? listHTML(p.tracks, 'pl:' + p.id) : emptyHTML('Плейлист пуст', 'Добавляй треки через ⋯ рядом с песней.')}`);
+    ${p.tracks.length ? listHTML(p.tracks, 'pl:' + p.id) : emptyHTML('Плейлист пуст', 'Добавляй треки через меню (три точки) рядом с песней.')}`);
 }
 
 function vProfile() {
@@ -706,7 +877,7 @@ function vProfile() {
   const days = Object.keys(S.stats.byDay).length, mins = Math.round(Object.values(S.stats.byDay).reduce((a, b) => a + b, 0) / 60);
   const arts = {}; S.history.forEach(h => arts[h.track.artist] = (arts[h.track.artist] || 0) + 1);
   const top = Object.entries(arts).sort((a, b) => b[1] - a[1]).slice(0, 5);
-  const themes = [['ghoul', 'Серебро', 'linear-gradient(145deg,#fff,#7d7d88)'], ['ice', 'Лёд', 'linear-gradient(145deg,#d9f3ff,#2a7fb0)'], ['ember', 'Медь', 'linear-gradient(145deg,#ffd9bd,#c2501c)'], ['toxic', 'Токсик', 'linear-gradient(145deg,#e4ff9a,#5f8f14)'], ['violet', 'Гуль', 'linear-gradient(145deg,#e4d8ff,#6d3fe0)']];
+  const themes = [['ghoul', 'Серебро', 'linear-gradient(145deg,#f1f1f4,#7d7d88)'], ['ice', 'Сталь', 'linear-gradient(145deg,#d3dde5,#5e7384)'], ['ember', 'Медь', 'linear-gradient(145deg,#ecd2ba,#9a5f3c)']];
   render(`<h1>Профиль</h1>
     ${u ? accountPanel(u) : authPanel()}
     <h3>Твой отпечаток</h3>
@@ -750,13 +921,13 @@ function bindAuth() {
       if (action === 'signup') {
         const d = await sb('/auth/v1/signup', { body: { email, password: pass } });
         const u = d.user || d;
-        if (d.access_token) { setSession(d); V.authMsg = null; toast('Аккаунт создан'); syncState('busy'); syncNow(true); authBusy = false; return route('profile'); }
+        if (d.access_token) { setSession(d); V.authMsg = null; toast('Аккаунт создан'); syncState('busy'); syncNow(true); authBusy = false; route('profile'); return resumePending(); }
         if (u && Array.isArray(u.identities) && u.identities.length === 0) { authBusy = false; return setMsg('err', 'Такой email уже зарегистрирован. Попробуй войти.', { switchTo: 'login' }); }
         V.authMode = 'login'; authBusy = false;
         return setMsg('ok', 'Проверь почту и подтверди адрес, затем войди в аккаунт.', { title: 'Письмо отправлено' });
       }
       const d = await sb('/auth/v1/token?grant_type=password', { body: { email, password: pass } });
-      setSession(d); V.authMsg = null; toast('Ты в аккаунте'); syncNow(true); authBusy = false; route('profile');
+      setSession(d); V.authMsg = null; toast('Ты в аккаунте'); syncNow(true); authBusy = false; route('profile'); resumePending();
     } catch (e) {
       authBusy = false; const r = authError(action, e);
       if (r.cooldown) store.set(cdKey(action), Date.now() + r.cooldown * 1000);
@@ -842,6 +1013,8 @@ const duration = f => new Promise(res => { const a = new Audio(), u = URL.create
 document.addEventListener('click', e => {
   const t = e.target;
   let el;
+  if ((el = t.closest('[data-wave]'))) { const j = +el.dataset.wave; if (j !== waveIdx) setWave(j, j > waveIdx ? 1 : -1); return; }
+  if ((el = t.closest('[data-retry]'))) { const id = el.dataset.retry, b = $('#sh-' + id); if (b) { b.innerHTML = skelShelf(); delete shelfCache[id]; loadShelf(id); } return; }
   if ((el = t.closest('[data-go]'))) { e.preventDefault(); return route(el.dataset.go); }
   if ((el = t.closest('[data-play]'))) { const s = el.dataset.play, k = s.lastIndexOf(':'); return playList(s.slice(0, k), +s.slice(k + 1)); }
   if ((el = t.closest('[data-fav]'))) return toggleFav(el.dataset.fav);
@@ -895,7 +1068,7 @@ document.addEventListener('keydown', e => {
 (async () => {
   applySettings(); route('home');
   try { localTracks = (await idb.all()).map(f => { const { blob, ...m } = f; return reg(m); }).sort((a, b) => b.added - a.added); } catch { }
-  if (S.session) { syncState('busy'); syncNow(true); }
+  if (S.session) getToken().then(tk => { if (tk) { syncState('busy'); syncNow(true); } });
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) navigator.serviceWorker.register('sw.js').catch(() => { });
 })();
 })();
